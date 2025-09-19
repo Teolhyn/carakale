@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose};
 use rand::{Rng, rng};
 use rayon::prelude::*;
-use sha3::{Digest, Keccak256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use tiny_keccak::{Hasher, Keccak};
 
 fn main() {
     println!("CaraKale - Rust KALE Miner");
@@ -33,9 +33,11 @@ fn main() {
 }
 
 fn keccak256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Keccak256::new();
+    let mut hasher = Keccak::v256();
     hasher.update(data);
-    hasher.finalize().into()
+    let mut output = [0u8; 32];
+    hasher.finalize(&mut output);
+    output
 }
 
 fn mine_kale(
@@ -65,10 +67,13 @@ fn mine_kale(
 
     let hash_counter = AtomicU64::new(0);
 
-    let result = (start_nonce..start_nonce + 1_000_000_000)
+    let result = (start_nonce..start_nonce + 10_000_000_000)
         .into_par_iter()
         .find_any(|&nonce| {
-            hash_counter.fetch_add(1, Ordering::Relaxed); // Count each hash computed
+            // Count every 1000th hash to reduce contention but keep accuracy
+            if nonce % 1000 == 0 {
+                hash_counter.fetch_add(1000, Ordering::Relaxed);
+            }
 
             // Use stack-allocated array instead of heap Vec
             let mut data = [0u8; 120]; // Max size: 8 + 32 + 8 + 70 (max Stellar address)
@@ -101,7 +106,7 @@ fn mine_kale(
         let actual_hashes = hash_counter.load(Ordering::Relaxed) as f64;
         let hash_rate = actual_hashes / elapsed;
         println!(
-            "Hash rate: {:.2} MH/s (KALE format) - {} hashes in {:.2}s",
+            "Hash rate: {:.2} MH/s (KALE format) - ~{} hashes in {:.2}s",
             hash_rate / 1_000_000.0,
             hash_counter.load(Ordering::Relaxed),
             elapsed
@@ -109,12 +114,7 @@ fn mine_kale(
         Some((nonce, hash))
     } else {
         let elapsed = start.elapsed().as_secs_f64();
-        let actual_hashes = hash_counter.load(Ordering::Relaxed) as f64;
-        let hash_rate = actual_hashes / elapsed;
-        println!(
-            "Gave up after 1B attempts - Hash rate: {:.2} MH/s",
-            hash_rate / 1_000_000.0
-        );
+        println!("Gave up after 10B attempts in {:.2}s", elapsed);
         None
     }
 }
