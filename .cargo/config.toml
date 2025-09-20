@@ -1,0 +1,12 @@
+[build]
+rustflags = [
+  "-C", "opt-level=3",       # maximum optimization
+  "-C", "lto=fat",          # thin LTO for cross-function inlining
+  "-C", "codegen-units=1",   # force LLVM to optimize across whole crate
+  "-C", "inline-threshold=2000" # more aggressive inlining
+]
+
+[target.'cfg(target_arch = "aarch64")']
+rustflags = [
+  "-C", "target-cpu=apple-m4",   # explicitly target your chip
+]
