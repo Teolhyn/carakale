@@ -5,15 +5,15 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22.1"
+crossterm = "0.29.0"
 hex = "0.4.3"
 rand = "0.9.2"
+ratatui = "0.29.0"
 rayon = "1.11.0"
 tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+wgpu = "26.0.1"
 
 [profile.release]
 codegen-units = 1
 lto = true
 panic = "abort"
-
-[target.'cfg(target_arch = "aarch64")']
-rustflags = ["-C", "target-cpu=native"]
