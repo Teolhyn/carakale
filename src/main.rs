@@ -29,12 +29,14 @@ struct MiningState {
     status: String,
     solution: Option<(u64, String)>,
     uptime: Duration,
+    gpu_name: String,
 }
 
 enum MiningUpdate {
     HashRate(f64),
     Solution(u64, String),
     Status(String),
+    GpuInfo(String),
 }
 
 fn draw_ui(frame: &mut Frame, state: &MiningState) {
@@ -42,7 +44,7 @@ fn draw_ui(frame: &mut Frame, state: &MiningState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Title
-            Constraint::Length(5), // Mining info
+            Constraint::Length(6), // Mining info
             Constraint::Min(0),    // Results
         ])
         .split(frame.area());
@@ -75,6 +77,10 @@ fn draw_ui(frame: &mut Frame, state: &MiningState) {
                 format!("{:.2} MH/s", state.hash_rate / 1_000_000.0),
                 Style::default().fg(Color::Magenta),
             ),
+        ]),
+        Line::from(vec![
+            Span::raw("Device: "),
+            Span::styled(&state.gpu_name, Style::default().fg(Color::Cyan)),
         ]),
     ];
     let info = Paragraph::new(info_text).block(
@@ -139,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status: "Initializing...".to_string(),
         solution: None,
         uptime: Duration::from_secs(0),
+        gpu_name: "Unknown".to_string(),
     };
 
     // Generate parameters and start mining in background
@@ -195,6 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mining_state.status = "Solution found!".to_string();
                 }
                 MiningUpdate::Status(status) => mining_state.status = status,
+                MiningUpdate::GpuInfo(gpu) => mining_state.gpu_name = gpu,
             }
         }
 
@@ -287,7 +295,20 @@ fn mine_kale_cpu(
             offset += miner_bytes.len();
 
             let hash = keccak256(&data[..offset]);
-            hash.iter().take(difficulty).all(|&b| b == 0)
+
+            // Count zero nibbles to match GPU shader logic
+            let mut zeros = 0;
+            for &byte in hash.iter() {
+                if byte == 0 {
+                    zeros += 2; // Full byte = 2 nibbles
+                } else if (byte >> 4) == 0 {
+                    zeros += 1; // Half byte = 1 nibble
+                    break;
+                } else {
+                    break;
+                }
+            }
+            zeros >= difficulty
         });
 
     if let Some(nonce) = result {
@@ -337,10 +358,9 @@ fn mine_kale_gpu(
             .expect("Failed to create adapter");
 
     if let Some(ref sender) = tx {
-        let _ = sender.send(MiningUpdate::Status(format!(
-            "GPU: {}",
-            adapter.get_info().name
-        )));
+        let _ = sender.send(MiningUpdate::GpuInfo(adapter.get_info().name.clone()));
+        // Small delay to ensure GPU info is processed before status flood
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -390,7 +410,11 @@ fn mine_kale_gpu(
 
     let data_len = kale_data_bytes.len() as u32;
     let nonce_offset = (8 + hash_bytes.len()) as u32; // Position where nonce goes in the data
-    let batch_size = 256u32; // workgroup_size from shader
+    let nonces_per_thread = 100000u32; // Cranked up for maximum M4 performance
+    let workgroups = 1024u32; // Maximum GPU utilization
+    let threads_per_workgroup = 256u32; // From @workgroup_size(256)
+    let total_hashes_per_iteration =
+        (workgroups as u64) * (threads_per_workgroup as u64) * (nonces_per_thread as u64);
 
     // Create compute pipeline
     let shader_module = device.create_shader_module(wgpu::include_wgsl!("keccak.wgsl"));
@@ -459,34 +483,46 @@ fn mine_kale_gpu(
         mapped_at_creation: false,
     });
 
+    // Create reusable uniform buffers (more efficient than recreating each iteration)
+    let params_data = [data_len, nonces_per_thread, difficulty as u32];
+    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Params"),
+        contents: bytemuck::cast_slice(&params_data),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let nonce_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Nonce"),
+        size: 3 * 4, // 3 u32s
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let mut current_nonce = start_nonce;
     let mut total_hashes = 0u64;
 
-    // Mining loop
-    for iteration in 0..10_000 {
+    // Mining loop - fewer iterations since each is now massive
+    for iteration in 0..100 {
+        // Send status update before starting iteration
+        if let Some(ref sender) = tx {
+            let _ = sender.send(MiningUpdate::Status(format!(
+                "Starting iteration {} - {} workgroups × {} nonces",
+                iteration + 1,
+                workgroups,
+                nonces_per_thread
+            )));
+        }
+
         // Clear found flag
         queue.write_buffer(&found_buffer, 0, bytemuck::cast_slice(&[0u32]));
 
-        // Create uniform buffers for this iteration
-        // Binding 1: params (len, batch, diff)
-        let params_data = [data_len, batch_size, difficulty as u32];
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Params"),
-            contents: bytemuck::cast_slice(&params_data),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        // Binding 2: nonce (nonceLow, nonceHigh, nonceOffset)
+        // Update nonce buffer for this iteration
         let nonce_data = [
             current_nonce as u32,
             (current_nonce >> 32) as u32,
             nonce_offset,
         ];
-        let nonce_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Nonce"),
-            contents: bytemuck::cast_slice(&nonce_data),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        queue.write_buffer(&nonce_buffer, 0, bytemuck::cast_slice(&nonce_data));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Mining Bind Group"),
@@ -530,7 +566,15 @@ fn mine_kale_gpu(
             });
             compute_pass.set_pipeline(&compute_pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(1, 1, 1); // Single workgroup with 256 threads
+            compute_pass.dispatch_workgroups(workgroups, 1, 1); // Multiple workgroups for higher throughput
+        }
+
+        // Send status update after dispatching compute
+        if let Some(ref sender) = tx {
+            let _ = sender.send(MiningUpdate::Status(format!(
+                "GPU computing {} hashes...",
+                total_hashes_per_iteration
+            )));
         }
 
         // Copy results to download buffers
@@ -567,75 +611,112 @@ fn mine_kale_gpu(
 
         let _ = device.poll(wgpu::PollType::Wait);
 
-        if found_receiver.recv().unwrap().is_ok() {
-            let found_data = found_slice.get_mapped_range();
-            let found_value =
-                u32::from_le_bytes([found_data[0], found_data[1], found_data[2], found_data[3]]);
-            drop(found_data);
-            found_download_buffer.unmap();
-
-            if found_value != 0 {
-                // Solution found! Read the hash and nonce
-                let hash_slice = hash_download_buffer.slice(..);
-                let (hash_sender, hash_receiver) = std::sync::mpsc::channel();
-                hash_slice.map_async(wgpu::MapMode::Read, move |result| {
-                    hash_sender.send(result).unwrap();
-                });
-
-                let nonce_slice = nonce_download_buffer.slice(..);
-                let (nonce_sender, nonce_receiver) = std::sync::mpsc::channel();
-                nonce_slice.map_async(wgpu::MapMode::Read, move |result| {
-                    nonce_sender.send(result).unwrap();
-                });
-
-                let _ = device.poll(wgpu::PollType::Wait);
-
-                if hash_receiver.recv().unwrap().is_ok() && nonce_receiver.recv().unwrap().is_ok() {
-                    let hash_data = hash_slice.get_mapped_range();
-                    let nonce_data = nonce_slice.get_mapped_range();
-
-                    // Convert hash from u32 array to [u8; 32]
-                    let mut hash_bytes = [0u8; 32];
-                    for i in 0..32 {
-                        hash_bytes[i] = hash_data[i];
-                    }
-
-                    // Read nonce (2 u32s)
-                    let nonce_low = u32::from_le_bytes([
-                        nonce_data[0],
-                        nonce_data[1],
-                        nonce_data[2],
-                        nonce_data[3],
-                    ]);
-                    let nonce_high = u32::from_le_bytes([
-                        nonce_data[4],
-                        nonce_data[5],
-                        nonce_data[6],
-                        nonce_data[7],
-                    ]);
-                    let nonce = ((nonce_high as u64) << 32) | (nonce_low as u64);
-
-                    drop(hash_data);
-                    drop(nonce_data);
-                    hash_download_buffer.unmap();
-                    nonce_download_buffer.unmap();
-
-                    return Some((nonce, hash_bytes));
-                }
-            }
-        } else {
-            found_download_buffer.unmap();
+        // Send status update that this iteration completed
+        if let Some(ref sender) = tx {
+            let _ = sender.send(MiningUpdate::Status(format!(
+                "Completed iteration, reading found flag..."
+            )));
         }
 
-        current_nonce += batch_size as u64;
-        total_hashes += batch_size as u64;
+        // Now that GPU work is complete, update counters and hash rate
+        current_nonce += total_hashes_per_iteration;
+        total_hashes += total_hashes_per_iteration;
 
-        // Send hash rate update every 10 iterations
-        if iteration % 10 == 0 && tx.is_some() {
+        // Send hash rate update (GPU work is now actually done)
+        if tx.is_some() {
             let elapsed = start.elapsed().as_secs_f64();
-            if elapsed > 0.1 {
+            if elapsed > 0.001 {
                 let hash_rate = total_hashes as f64 / elapsed;
                 let _ = tx.as_ref().unwrap().send(MiningUpdate::HashRate(hash_rate));
+            }
+        }
+
+        // Use timeout to prevent infinite hangs
+        match found_receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) if result.is_ok() => {
+                if let Some(ref sender) = tx {
+                    let _ = sender.send(MiningUpdate::Status("Reading found buffer...".to_string()));
+                }
+
+                let found_data = found_slice.get_mapped_range();
+                let found_value =
+                    u32::from_le_bytes([found_data[0], found_data[1], found_data[2], found_data[3]]);
+                drop(found_data);
+                found_download_buffer.unmap();
+
+                if found_value != 0 {
+                    if let Some(ref sender) = tx {
+                        let _ = sender.send(MiningUpdate::Status("Solution found! Reading hash and nonce...".to_string()));
+                    }
+                    // Solution found! Read the hash and nonce
+                    let hash_slice = hash_download_buffer.slice(..);
+                    let (hash_sender, hash_receiver) = std::sync::mpsc::channel();
+                    hash_slice.map_async(wgpu::MapMode::Read, move |result| {
+                        hash_sender.send(result).unwrap();
+                    });
+
+                    let nonce_slice = nonce_download_buffer.slice(..);
+                    let (nonce_sender, nonce_receiver) = std::sync::mpsc::channel();
+                    nonce_slice.map_async(wgpu::MapMode::Read, move |result| {
+                        nonce_sender.send(result).unwrap();
+                    });
+
+                    let _ = device.poll(wgpu::PollType::Wait);
+
+                    if hash_receiver.recv().unwrap().is_ok() && nonce_receiver.recv().unwrap().is_ok() {
+                        let hash_data = hash_slice.get_mapped_range();
+                        let nonce_data = nonce_slice.get_mapped_range();
+
+                        // Convert hash from u32 array to [u8; 32]
+                        // The shader stores 32 u32 values, we need to convert to 32 bytes
+                        let mut hash_bytes = [0u8; 32];
+                        for i in 0..32 {
+                            let u32_val = u32::from_le_bytes([
+                                hash_data[i * 4],
+                                hash_data[i * 4 + 1],
+                                hash_data[i * 4 + 2],
+                                hash_data[i * 4 + 3],
+                            ]);
+                            hash_bytes[i] = (u32_val & 0xFF) as u8;
+                        }
+
+                        // Read nonce (2 u32s)
+                        let nonce_low = u32::from_le_bytes([
+                            nonce_data[0],
+                            nonce_data[1],
+                            nonce_data[2],
+                            nonce_data[3],
+                        ]);
+                        let nonce_high = u32::from_le_bytes([
+                            nonce_data[4],
+                            nonce_data[5],
+                            nonce_data[6],
+                            nonce_data[7],
+                        ]);
+                        let nonce = ((nonce_high as u64) << 32) | (nonce_low as u64);
+
+                        drop(hash_data);
+                        drop(nonce_data);
+                        hash_download_buffer.unmap();
+                        nonce_download_buffer.unmap();
+
+                        return Some((nonce, hash_bytes));
+                    }
+                }
+            }
+            Ok(_) => {
+                // Mapping failed
+                if let Some(ref sender) = tx {
+                    let _ = sender.send(MiningUpdate::Status("Buffer mapping failed, continuing...".to_string()));
+                }
+                found_download_buffer.unmap();
+            }
+            Err(_) => {
+                // Timeout
+                if let Some(ref sender) = tx {
+                    let _ = sender.send(MiningUpdate::Status("Buffer read timeout, continuing...".to_string()));
+                }
+                found_download_buffer.unmap();
             }
         }
     }
@@ -658,7 +739,7 @@ fn generate_realistic_params() -> (u64, String, u64, usize, String) {
     let start_nonce = rng.random_range(0..1_000_000);
 
     // Realistic difficulty (KALE typically uses 2-4 leading zero bytes)
-    let difficulty = 5;
+    let difficulty = 9;
 
     // Generate realistic Stellar address
     let miner_address = generate_stellar_address();
